@@ -1,0 +1,103 @@
+# spikes/SConscript: only exists in @PROJECT@-spike. Loaded by the original repo's SConstruct if present.
+import os
+import subprocess
+
+Import('env')
+
+ROOT = Dir('#').abspath    # git commands work from anywhere inside the repo
+DEV_REMOTE = '@PROJECT@-dev'
+BRANCH = '@BRANCH@'
+
+
+def _git(*args):
+    print('git ' + ' '.join(args))
+    subprocess.run(['git', *args], cwd=ROOT, check=True)
+
+
+def _git_out(*args):
+    return subprocess.run(['git', *args], cwd=ROOT, check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+def _spiked_submodules():
+    """[(path, dev_remote)] for submodules that have their own spike repo.
+
+    new-spike.py marks those by adding a fetch-only '<name>-dev' remote inside them.
+    """
+    out = subprocess.run(['git', 'config', '-f', '.gitmodules', '--get-regexp',
+                          r'^submodule\..*\.path$'],
+                         cwd=ROOT, capture_output=True, text=True).stdout
+    result = []
+    for line in out.splitlines():
+        path = line.split(' ', 1)[1]
+        sub = os.path.join(ROOT, path)
+        if not os.path.exists(os.path.join(sub, '.git')):
+            continue
+        remotes = _git_out('-C', sub, 'remote').split()
+        dev = [r for r in remotes if r.endswith('-dev')]
+        if dev:
+            result.append((path, dev[0]))
+    return result
+
+
+def _update_submodule_spike(path, dev_remote):
+    """Merge the original submodule repo into its spike repo and push it."""
+    sub = os.path.join(ROOT, path)
+    if _git_out('-C', sub, 'status', '--porcelain', '--untracked-files=no'):
+        print(f'fetch-dev: submodule {path} has uncommitted changes; commit or stash them first.')
+        return False
+
+    _git('-C', sub, 'fetch', 'origin')
+    _git('-C', sub, 'fetch', dev_remote)
+    head = subprocess.run(['git', '-C', sub, 'symbolic-ref', '--short', 'refs/remotes/origin/HEAD'],
+                          capture_output=True, text=True).stdout.strip()
+    branch = head.split('/', 1)[1] if head else BRANCH
+
+    if _git_out('-C', sub, 'branch', '--list', branch):
+        _git('-C', sub, 'switch', branch)
+        _git('-C', sub, 'merge', '--ff-only', f'origin/{branch}')
+    else:
+        _git('-C', sub, 'switch', '-c', branch, '--track', f'origin/{branch}')
+    _git('-C', sub, 'merge', '--no-edit', f'{dev_remote}/{branch}')
+    _git('-C', sub, 'push', 'origin', branch)
+
+    # Put the submodule back on the commit this repo records.
+    _git('submodule', 'update', '--', path)
+    return True
+
+
+def fetch_dev(target, source, env):
+    try:
+        if _git_out('status', '--porcelain', '--untracked-files=no'):
+            print('fetch-dev: you have uncommitted changes; commit or stash them first.')
+            return 1
+
+        branch = _git_out('branch', '--show-current')
+        if branch != BRANCH:
+            print(f'fetch-dev: on "{branch}"; run "git switch --recurse-submodules {BRANCH}" first.')
+            return 1
+
+        # Submodule spike repos first, so the commits the original repo records exist there.
+        for path, dev_remote in _spiked_submodules():
+            print(f'fetch-dev: updating the spike repo of submodule {path}')
+            if not _update_submodule_spike(path, dev_remote):
+                return 1
+
+        _git('fetch', DEV_REMOTE)
+        _git('merge', '--no-edit', f'{DEV_REMOTE}/{BRANCH}')
+        _git('submodule', 'update', '--init', '--recursive')
+        _git('push', 'origin', BRANCH)
+    except subprocess.CalledProcessError as e:
+        print(f'fetch-dev: git failed ({e.returncode}). If a merge conflicted, '
+              'resolve it and commit, or run "git merge --abort" (inside the submodule, '
+              'if that is where it stopped).')
+        return 1
+    return 0
+
+
+fetch = env.Alias('fetch-dev', [], env.Action(fetch_dev, f'Syncing spike repo {BRANCH} with {DEV_REMOTE}/{BRANCH}'))
+env.AlwaysBuild(fetch)
+
+# Add spike-only targets below, e.g.:
+# spike = env.Program('build/spike-renderer', Glob('#/../spikes/renderer/*.cpp'))
+# Alias('spikes', spike)
